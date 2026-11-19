@@ -7,6 +7,17 @@ from triton.language.extra import libdevice
 # Kernel 1: Fused Row-wise Quantization (FP16/BF16 -> INT8 + Scale)
 # =============================================================================
 
+# krea2-run patch: tuning key v3
+# Triton tunes a kernel again for every new value of its key. M (batch x tokens) changes with the prompt
+# length, so the key uses M rounded to a size range instead; the kernel still gets the real M.
+def _tuning_m(M):
+    if M <= 512:
+        return max(16, triton.next_power_of_2(M))
+    if M <= 4096:
+        return (M + 511) // 512 * 512
+    return 8192
+
+
 @triton.jit
 def _quantize_rowwise_kernel(
     x_ptr,      # Input pointer (FP16/BF16)
@@ -86,7 +97,7 @@ def triton_quantize_rowwise(x: torch.Tensor):
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     ],
-    key=['M', 'N', 'K'],
+    key=['M_KEY', 'N', 'K'],  # krea2-run patch: tuning key v3
 )
 @triton.jit
 def _int8_matmul_dequant_kernel(
@@ -94,7 +105,7 @@ def _int8_matmul_dequant_kernel(
     a_ptr, b_ptr, c_ptr,
     a_scale_ptr, b_scale_ptr, bias_ptr,
     # Matrix Dimensions
-    M, N, K,
+    M, N, K, M_KEY,
     # Strides
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -222,7 +233,7 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
         b_scale_ptr=weight_scale, 
         bias_ptr=bias_ptr,
         # Shapes
-        M=M, N=N, K=K,
+        M=M, N=N, K=K, M_KEY=_tuning_m(M),
         # Strides
         stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
         stride_bk=weight.stride(1), stride_bn=weight.stride(0), # Transposed access of W
@@ -248,7 +259,7 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
     ],
-    key=['M', 'N', 'K'],
+    key=['M_KEY', 'N', 'K'],  # krea2-run patch: tuning key v3
 )
 @triton.jit
 def _int8_matmul_dequant_per_row_kernel(
@@ -256,7 +267,7 @@ def _int8_matmul_dequant_per_row_kernel(
     a_ptr, b_ptr, c_ptr,
     a_scale_ptr, b_scale_ptr, bias_ptr,
     # Matrix Dimensions
-    M, N, K,
+    M, N, K, M_KEY,
     # Strides
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -361,7 +372,7 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
         a_scale_ptr=x_scale,
         b_scale_ptr=ws,
         bias_ptr=bias_ptr,
-        M=M, N=N, K=K,
+        M=M, N=N, K=K, M_KEY=_tuning_m(M),
         stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
         stride_bk=weight.stride(1), stride_bn=weight.stride(0),
         stride_cm=output.stride(0), stride_cn=output.stride(1),
@@ -370,3 +381,10 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
 
     # 6. Reshape output
     return output.reshape(x_shape_orig[:-1] + (N,))
+
+
+# krea2-run patch: tuning key v3: KSD_INT8_ONE_CONFIG keeps only each kernel's first setting, so Triton tunes nothing (for measuring)
+import os as _ksd_os
+if _ksd_os.environ.get("KSD_INT8_ONE_CONFIG"):
+    for _ksd_kernel in (_int8_matmul_dequant_kernel, _int8_matmul_dequant_per_row_kernel):
+        _ksd_kernel.configs = _ksd_kernel.configs[:1]
