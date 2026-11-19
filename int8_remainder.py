@@ -24,7 +24,7 @@ import re
 
 import torch
 
-_state = {"path": None, "handle": None, "keys": {}, "bits": None}
+_state = {"path": None, "handle": None, "keys": {}, "bits": None, "model": None, "looked": 0.0}
 
 
 def norm(key):
@@ -35,8 +35,9 @@ def norm(key):
 
 def use_for(model_path):
     """Opens the remainder file that belongs to this model file, if there is one."""
+    import time
     from safetensors import safe_open
-    _state.update(path=None, handle=None, keys={}, bits=None)
+    _state.update(path=None, handle=None, keys={}, bits=None, model=model_path, looked=time.time())
     folder, name = os.path.split(model_path)
     stem = os.path.splitext(name)[0]
     for f in sorted(os.listdir(folder)):
@@ -63,8 +64,17 @@ def unpack(packed, bits, n):
     return (c.float() + 0.5) / levels - 0.5
 
 
+def _look_again():
+    """A remainder file that arrives after the model was loaded (a worker fetching it in the background) is used
+    from then on: ComfyUI keeps a loaded model, so use_for would not run again. Looked for at most every 10 s."""
+    import time
+    if _state["handle"] is None and _state["model"] and time.time() - _state["looked"] > 10:
+        use_for(_state["model"])
+
+
 def with_remainder(key, q):
     """The INT8 weight q of layer `key` with its remainder added (float, in steps), or q as it is."""
+    _look_again()
     k = _state["keys"].get(norm(key)) if _state["handle"] is not None else None
     if k is None or q.dtype != torch.int8:
         return q
