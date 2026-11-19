@@ -56,6 +56,7 @@ class UNetLoaderINTW8A8:
 
     def load_unet(self, unet_name, weight_dtype, model_type, on_the_fly_quantization, enable_convrot=False, lora_mode="None", pre_lora=None, disable_dynamic=False):
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
+        from . import int8_remainder; int8_remainder.use_for(unet_path)  # ksd: remainder
 
         # Backward compatibility for workflows saved with the old dynamic_lora boolean widget.
         if isinstance(lora_mode, bool):

@@ -420,6 +420,18 @@ if _COMFY_OPS_AVAILABLE:
                     except Exception:
                         pass
                 
+                if (weight_tensor is not None and weight_tensor.dtype == torch.int8 and weight_scale is not None
+                        and Int8TensorwiseOps.lora_patches):  # ksd: remainder: pre-LoRA into INT8 layers
+                    _patches = Int8TensorwiseOps.lora_patches.get(normalize_key(weight_key))
+                    if _patches:
+                        from . import int8_remainder
+                        _device = getattr(Int8TensorwiseOps, 'dynamic_load_device', None) or (
+                            torch.device('cuda') if torch.cuda.is_available() else weight_tensor.device)
+                        weight_tensor = int8_remainder.bake_at_load(self, weight_key, weight_tensor, weight_scale,
+                                                                    _patches, quant_conf_parsed, _device)
+                        if not hasattr(Int8TensorwiseOps, 'applied_lora_patches'):
+                            Int8TensorwiseOps.applied_lora_patches = set()
+                        Int8TensorwiseOps.applied_lora_patches.add(normalize_key(weight_key))
                 pending_weight_lora_patches = None
                 if weight_tensor is not None and weight_tensor.dtype != torch.int8:
                     pending_weight_lora_patches = Int8TensorwiseOps.lora_patches.get(normalize_key(weight_key))
@@ -782,7 +794,8 @@ class INT8LowVramPatch:
         if isinstance(scale, torch.Tensor):
             scale = scale.to(weight.device)
 
-        weight_float = dequantize(weight, scale)
+        from . import int8_remainder  # ksd: remainder
+        weight_float = dequantize(int8_remainder.with_remainder(self.key, weight), scale)
 
         use_convrot = getattr(self.module, "_use_convrot", False)
         if use_convrot:
@@ -879,7 +892,8 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
                 # 1. Dequantize to float (move scale to device_to since it lives on CPU)
                 if isinstance(scale, torch.Tensor):
                     scale = scale.to(device_to)
-                weight_float = dequantize(source_weight.to(device_to), scale)
+                from . import int8_remainder  # ksd: remainder
+                weight_float = dequantize(int8_remainder.with_remainder(key, source_weight.to(device_to)), scale)
 
                 # 2. Handle ConvRot: de-rotate into weight space before patching
                 use_convrot = getattr(module, "_use_convrot", False)
